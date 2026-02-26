@@ -1,0 +1,26 @@
+# ── PyTorch ────────────────────────────────────────────────────────────────────
+# Standard PyPI wheel includes MPS support on macOS (Apple Silicon)
+torch==2.5.1
+torchvision==0.20.1   # used by comotion dataloading (transforms.functional)
+
+# ── CoMotion dependencies ──────────────────────────────────────────────────────
+coremltools>=8.1      # Python 3.12 compatible; enables ANE-accelerated detection
+einops
+pypose
+scenedetect[opencv]
+tensordict
+timm==1.0.13
+transformers==4.48.0
+tqdm
+
+# ── Video I/O ──────────────────────────────────────────────────────────────────
+opencv-python
+ffmpeg-python
+
+# ── stream-pose pipeline ───────────────────────────────────────────────────────
+requests              # Pexels API (video_sources/fetch_videos.py)
+python-dotenv         # loads .env for API keys
+numpy
+matplotlib            # view_results.py interactive 3D viewer
+
+# ── chumpy and comotion_demo are installed by setup.sh (special flags needed) ──

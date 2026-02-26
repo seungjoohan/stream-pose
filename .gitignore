@@ -1,0 +1,21 @@
+# secrets
+.env
+
+# python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# project outputs
+results/
+
+# test / scratch videos
+*.mp4
+*.gif
+
+# claude session data
+.claude/
+
+# macOS
+.DS_Store
