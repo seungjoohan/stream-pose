@@ -28,6 +28,7 @@ Usage (consumer/training side):
 
 import threading
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 
@@ -285,7 +286,7 @@ class PoseProducer(threading.Thread):
         frameskip:   Process every Nth frame (reduce labeling load).
         min_half_body_joints: If > 0, skip videos where no person has this many
                              visible joints (filters legs-only, arms-only, etc.).
-                             Set to 0 to disable. Default 14 (~half of 27 joints).
+                             Set to 0 to disable. Default 12 (relaxed for edge crops).
     """
 
     def __init__(
@@ -295,7 +296,7 @@ class PoseProducer(threading.Thread):
         labeler=None,
         loop: bool = True,
         frameskip: int = 2,
-        min_half_body_joints: int = 14,
+        min_half_body_joints: int = 12,
     ):
         super().__init__(daemon=True, name="PoseProducer")
         self._video_paths = [Path(p) for p in video_paths]
@@ -323,6 +324,7 @@ class PoseProducer(threading.Thread):
 
         fail_counts: dict[str, int] = {}
         skip_set: set[str] = set()
+        passed_filter: set[str] = set()  # videos that passed half-body check; skip re-check on loop
 
         while not self._stop_event.is_set():
             for vp in self._video_paths:
@@ -331,7 +333,7 @@ class PoseProducer(threading.Thread):
                 key = str(vp)
                 if key in skip_set:
                     continue
-                if self._min_half_body_joints > 0:
+                if self._min_half_body_joints > 0 and key not in passed_filter:
                     try:
                         if not self._labeler.video_has_half_body(
                             vp, min_visible_joints=self._min_half_body_joints
@@ -342,8 +344,12 @@ class PoseProducer(threading.Thread):
                             )
                             skip_set.add(key)
                             continue
+                        passed_filter.add(key)
                     except Exception as e:
-                        print(f"[PoseProducer] Half-body check failed for {Path(vp).name}: {e}")
+                        err_msg = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                        print(f"[PoseProducer] Half-body check failed for {Path(vp).name}: {err_msg}")
+                        if isinstance(e, AssertionError):
+                            traceback.print_exc()
                         skip_set.add(key)
                         continue
                 try:

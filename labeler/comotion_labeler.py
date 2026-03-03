@@ -172,9 +172,9 @@ class CoMotionLabeler:
     def video_has_half_body(
         self,
         video_path: Path | str,
-        sample_frames: int = 20,
-        sample_frameskip: int = 30,
-        min_visible_joints: int = 14,
+        sample_frames: int = 30,
+        sample_frameskip: int = 15,
+        min_visible_joints: int = 12,
     ) -> bool:
         """
         Quick check: does the video contain at least one person with ≥half body visible?
@@ -183,28 +183,39 @@ class CoMotionLabeler:
         at least min_visible_joints visible (out of 27). Use to filter out videos
         with only legs, only arms, etc. before full labeling.
 
+        Visibility = joints projecting within image bounds; edge crops can reduce
+        visible count, so 12 is a reasonable "half body" threshold.
+
         Args:
             video_path:         Path to video.
             sample_frames:      Max frames to check before giving up.
             sample_frameskip:   Sample every Nth frame (sparse = faster).
-            min_visible_joints: Threshold for "half body" (14 ≈ half of 27).
+            min_visible_joints: Threshold for "half body" (12 ≈ upper/lower body core).
 
         Returns:
             True if video passes filter, False otherwise.
         """
-        count = 0
-        for frame_label in self.label_video(
-            video_path,
-            frameskip=sample_frameskip,
-            min_visible_joints=1,  # accept all for this check
-        ):
-            for p in frame_label["persons"]:
-                if int(p["visibility"].sum()) >= min_visible_joints:
-                    return True
-            count += 1
-            if count >= sample_frames:
-                break
-        return False
+        def _check(use_mps: bool) -> bool:
+            count = 0
+            for frame_label in self.label_video(
+                video_path,
+                frameskip=sample_frameskip,
+                min_visible_joints=1,  # accept all for this check
+                use_mps=use_mps,
+            ):
+                for p in frame_label["persons"]:
+                    if int(p["visibility"].sum()) >= min_visible_joints:
+                        return True
+                count += 1
+                if count >= sample_frames:
+                    break
+            return False
+
+        try:
+            return _check(use_mps=self._use_mps)
+        except AssertionError:
+            # MPS can raise AssertionError on empty tensors (e.g. frames with no detections)
+            return _check(use_mps=False)
 
     def label_video(
         self,
@@ -213,6 +224,7 @@ class CoMotionLabeler:
         num_frames: int = 1_000_000_000,
         frameskip: int = 1,
         min_visible_joints: int = 8,
+        use_mps: bool | None = None,
     ) -> Generator[dict, None, None]:
         """
         Stream-label a single video with CoMotion.
@@ -232,8 +244,10 @@ class CoMotionLabeler:
             num_frames:         Maximum number of frames to process.
             frameskip:          Process every Nth frame (1 = every frame).
             min_visible_joints: Discard detections with fewer visible joints than this.
+            use_mps: Override MPS for refinement (None = use default from config).
         """
         self._ensure_model()
+        use_mps_val = self._use_mps if use_mps is None else use_mps
 
         # Deferred imports — comotion_demo asserts SMPL at module load
         from comotion_demo.utils import dataloading
@@ -264,7 +278,7 @@ class CoMotionLabeler:
                 initialized = True
 
             with torch.no_grad():
-                _, track_state = self._model(image_tensor, K, use_mps=self._use_mps)
+                _, track_state = self._model(image_tensor, K, use_mps=use_mps_val)
 
             # TrackTensorState fields (batch dim 0, track dim 1):
             #   pred_3d: (1, 48, 27, 3)  camera-space 3D

@@ -11,12 +11,16 @@ Usage:
     # Train on Pexels-fetched videos
     python train.py --fetch --queries "sports athlete" "yoga pose" --n 3
 
+    # Continue from latest checkpoint (pose_step{N}.pt or pose_step{N}_final.pt)
+    python train.py --fetch --resume --steps 10000
+
     # Custom training parameters
     python train.py --video clip.mp4 --lr 5e-4 --batch-size 32 --steps 20000
 """
 
 import argparse
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -28,6 +32,29 @@ from torch.utils.data import DataLoader
 _ROOT = Path(__file__).parent
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "ml-comotion" / "src"))
+
+
+CHECKPOINT_PATTERN = re.compile(r"pose_step(\d+)(_final)?\.pt")
+
+
+def find_latest_checkpoint(checkpoint_dir: Path) -> tuple[Path, int] | None:
+    """
+    Find the checkpoint with the highest step number in checkpoint_dir.
+
+    Matches pose_step{N}.pt or pose_step{N}_final.pt. Returns (path, step_num)
+    or None if no matching checkpoint found.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.exists():
+        return None
+    best: tuple[Path, int] | None = None
+    for p in checkpoint_dir.glob("pose_step*.pt"):
+        m = CHECKPOINT_PATTERN.fullmatch(p.name)
+        if m:
+            step_num = int(m.group(1))
+            if best is None or step_num > best[1]:
+                best = (p, step_num)
+    return best
 
 
 def get_device(arg: str) -> str:
@@ -114,6 +141,8 @@ def parse_args() -> argparse.Namespace:
                         help="Save checkpoint every N steps")
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/"),
                         help="Where to save checkpoints")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from latest checkpoint in checkpoint-dir (pose_step{N}.pt)")
     parser.add_argument("--video", type=Path, default=None,
                         help="Local video path (skip Pexels, use this instead)")
     parser.add_argument("--fetch", action="store_true",
@@ -121,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto",
                         choices=["auto", "mps", "cuda", "cpu"],
                         help="Device for training")
-    parser.add_argument("--min-half-body-joints", type=int, default=14,
+    parser.add_argument("--min-half-body-joints", type=int, default=10,
                         help="Skip videos with no person having this many visible joints (0=disable)")
     return parser.parse_args()
 
@@ -187,6 +216,33 @@ def main():
     model = DinoV2PoseModel(freeze_backbone=True).to(device)
     optim = torch.optim.Adam(model.head.parameters(), lr=args.lr)
 
+    # ── Checkpoint directory ──────────────────────────────────────────────────
+    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Resume from checkpoint ───────────────────────────────────────────────
+    step = 0
+    if args.resume:
+        found = find_latest_checkpoint(args.checkpoint_dir)
+        if found:
+            ckpt_path, step = found
+            try:
+                ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+            except TypeError:
+                ckpt = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(ckpt["model"], strict=True)
+            if "optim" in ckpt:
+                optim.load_state_dict(ckpt["optim"])
+            print(f"[train] Resumed from {ckpt_path.name} (step {step})")
+            if args.steps > 0 and step >= args.steps:
+                print(f"[train] Already at step {step} >= {args.steps}. Nothing to do.")
+                producer.stop()
+                producer.join(timeout=10)
+                sys.exit(0)
+        else:
+            print("[train] --resume: no checkpoint found, starting from step 0")
+
+    t0 = time.time()
+
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -195,12 +251,7 @@ def main():
         drop_last=True,
     )
 
-    # ── Checkpoint directory ──────────────────────────────────────────────────
-    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     # ── Training loop ─────────────────────────────────────────────────────────
-    step = 0
-    t0 = time.time()
 
     def save_checkpoint(step: int, tag: str = ""):
         name = f"pose_step{step}{tag}.pt"

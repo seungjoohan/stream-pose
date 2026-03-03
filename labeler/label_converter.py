@@ -5,9 +5,10 @@ Conversion steps:
   1. Project camera-space 3D → 2D pixel coords using K intrinsics
   2. Check each joint is within image bounds → per-joint visibility mask (27,)
   3. Subtract pelvis (joint 0) from all joints → pelvis-relative 3D coords
+  4. Normalize by pelvis-to-head distance → scale-invariant (resolution, camera, body size)
 
-Result: scale-invariant, camera-distance-independent representation.
-Training generalizes across videos shot from different distances.
+Result: scale-invariant, camera-distance-independent, body-size-invariant representation.
+Training generalizes across videos shot from different distances and people of different heights.
 
 Joint convention — SMPL joints_face (27 joints):
   Index  Name
@@ -84,6 +85,50 @@ def to_pelvis_relative(kpts3d: np.ndarray) -> np.ndarray:
     return kpts3d - pelvis
 
 
+# Reference joints for scale normalization (pelvis=0, neck=12, head=15)
+REF_PELVIS, REF_HEAD, REF_NECK = 0, 15, 12
+
+
+def normalize_by_scale(
+    kpts3d: np.ndarray,
+    ref_a: int = REF_PELVIS,
+    ref_b: int = REF_HEAD,
+    fallback_ref_b: int = REF_NECK,
+) -> np.ndarray:
+    """
+    Scale-normalize keypoints so ref distance = 1.0.
+
+    Uses pelvis-to-head by default; falls back to pelvis-to-neck if head is
+    degenerate (same as pelvis). Makes representation invariant to resolution,
+    camera distance, and body size.
+
+    Args:
+        kpts3d: (..., 27, 3) pelvis-relative keypoints
+        ref_a:  first reference joint (default pelvis)
+        ref_b:  second reference joint (default head)
+        fallback_ref_b: fallback if ref_b is degenerate (default neck)
+
+    Returns:
+        kpts3d_scaled: (..., 27, 3) with ||kpts[ref_b] - kpts[ref_a]|| = 1
+    """
+    ref_dist = np.linalg.norm(
+        kpts3d[..., ref_b : ref_b + 1, :] - kpts3d[..., ref_a : ref_a + 1, :],
+        axis=-1,
+        keepdims=True,
+    )
+    if fallback_ref_b is not None:
+        fallback_dist = np.linalg.norm(
+            kpts3d[..., fallback_ref_b : fallback_ref_b + 1, :]
+            - kpts3d[..., ref_a : ref_a + 1, :],
+            axis=-1,
+            keepdims=True,
+        )
+        use_fallback = (ref_dist < 1e-6) & (fallback_dist >= 1e-6)
+        ref_dist = np.where(use_fallback, fallback_dist, ref_dist)
+    ref_dist = np.maximum(ref_dist, 1e-6)
+    return kpts3d / ref_dist
+
+
 def convert_label(
     pred_3d_cam: np.ndarray,
     K: np.ndarray,
@@ -102,16 +147,17 @@ def convert_label(
         det_confidence: float | None   CoMotion detection confidence score
 
     Returns dict:
-        kpts3d:     (27, 3) float32  pelvis-relative 3D keypoints
+        kpts3d:     (27, 3) float32  pelvis-relative, scale-normalized (ref dist=1)
         visibility: (27,)   bool     per-joint inbounds mask
         confidence: float            detection-level score (0.0 if unavailable)
     """
     kpts2d = project_to_2d(pred_3d_cam, K)           # (27, 2)
     visibility = compute_visibility(kpts2d, img_hw)   # (27,) bool
     kpts3d_rel = to_pelvis_relative(pred_3d_cam)      # (27, 3)
+    kpts3d_norm = normalize_by_scale(kpts3d_rel)      # (27, 3) ref dist = 1
 
     label = {
-        "kpts3d": kpts3d_rel.astype(np.float32),
+        "kpts3d": kpts3d_norm.astype(np.float32),
         "visibility": visibility,
         "confidence": float(det_confidence) if det_confidence is not None else 0.0,
     }
@@ -146,7 +192,7 @@ def convert_frame_labels(
     Returns:
         List of n dicts, each containing:
             track_id:   int
-            kpts3d:     (27, 3) float32  pelvis-relative
+            kpts3d:     (27, 3) float32  pelvis-relative, scale-normalized (ref=1)
             visibility: (27,)   bool
             confidence: float
             pred_2d:    (27, 2) float32  (if provided)

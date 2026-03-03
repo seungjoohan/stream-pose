@@ -74,7 +74,7 @@ def run_pipeline(
     video_dir: Path,
     loop: bool,
     frameskip: int,
-    min_half_body_joints: int = 14,
+    min_half_body_joints: int = 12,
 ):
     """
     Run the full persistent pipeline:
@@ -156,7 +156,7 @@ def main():
                         help="Process every Nth frame (default: 2)")
     parser.add_argument("--max-frames", type=int, default=50,
                         help="Max frames per video in dry-run mode")
-    parser.add_argument("--min-half-body-joints", type=int, default=14,
+    parser.add_argument("--min-half-body-joints", type=int, default=12,
                         help="Skip videos with no person having this many visible joints (0=disable)")
     args = parser.parse_args()
 
