@@ -25,6 +25,7 @@ import threading
 from pathlib import Path
 from typing import Generator
 
+import cv2
 import numpy as np
 import torch
 
@@ -113,6 +114,28 @@ def _check_smpl():
         )
 
 
+def _bbox_from_kpts2d(kpts2d: np.ndarray, img_hw: tuple, pad: float = 0.2) -> tuple:
+    """Return (x0, y0, x1, y1) int bbox from (N,2) pixel keypoints, with padding, clipped to image."""
+    h, w = img_hw
+    x0, y0 = kpts2d[:, 0].min(), kpts2d[:, 1].min()
+    x1, y1 = kpts2d[:, 0].max(), kpts2d[:, 1].max()
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    hw = max(x1 - x0, y1 - y0) * (1 + pad) / 2
+    x0, y0, x1, y1 = cx - hw, cy - hw, cx + hw, cy + hw
+    x0, y0 = max(0, int(x0)), max(0, int(y0))
+    x1, y1 = min(w, int(x1) + 1), min(h, int(y1) + 1)
+    return x0, y0, x1, y1
+
+
+def _extract_crop(image_hwc: np.ndarray, bbox: tuple, size: int = 128) -> np.ndarray:
+    """Crop and resize to (size, size, 3) uint8."""
+    x0, y0, x1, y1 = bbox
+    crop = image_hwc[y0:y1, x0:x1]
+    if crop.size == 0:
+        return np.zeros((size, size, 3), dtype=np.uint8)
+    return cv2.resize(crop, (size, size), interpolation=cv2.INTER_LINEAR)
+
+
 class CoMotionLabeler:
     """
     Runs CoMotion on video files and yields per-frame pose labels.
@@ -146,6 +169,43 @@ class CoMotionLabeler:
         self._model = _load_model(cfg["use_coreml"], cfg["device"])
         print("[CoMotionLabeler] Model ready.")
 
+    def video_has_half_body(
+        self,
+        video_path: Path | str,
+        sample_frames: int = 20,
+        sample_frameskip: int = 30,
+        min_visible_joints: int = 14,
+    ) -> bool:
+        """
+        Quick check: does the video contain at least one person with ≥half body visible?
+
+        Samples frames (every sample_frameskip) and returns True if any person has
+        at least min_visible_joints visible (out of 27). Use to filter out videos
+        with only legs, only arms, etc. before full labeling.
+
+        Args:
+            video_path:         Path to video.
+            sample_frames:      Max frames to check before giving up.
+            sample_frameskip:   Sample every Nth frame (sparse = faster).
+            min_visible_joints: Threshold for "half body" (14 ≈ half of 27).
+
+        Returns:
+            True if video passes filter, False otherwise.
+        """
+        count = 0
+        for frame_label in self.label_video(
+            video_path,
+            frameskip=sample_frameskip,
+            min_visible_joints=1,  # accept all for this check
+        ):
+            for p in frame_label["persons"]:
+                if int(p["visibility"].sum()) >= min_visible_joints:
+                    return True
+            count += 1
+            if count >= sample_frames:
+                break
+        return False
+
     def label_video(
         self,
         video_path: Path | str,
@@ -178,8 +238,6 @@ class CoMotionLabeler:
         # Deferred imports — comotion_demo asserts SMPL at module load
         from comotion_demo.utils import dataloading
         from comotion_demo.utils.helper import check_inbounds
-
-        import cv2
 
         video_path = Path(video_path)
         if not video_path.exists():
@@ -226,11 +284,23 @@ class CoMotionLabeler:
 
             K_np = K.numpy()
 
-            # Build per-person labels — confidence=1.0 for all active tracks
+            # Extract per-person image crops from current frame
+            image_rgb_hwc = (
+                image_tensor.permute(1, 2, 0).clamp(0, 1) * 255
+            ).byte().cpu().numpy()
+
             n_active = len(ids_active)
+            crops_rgb = []
+            for i in range(n_active):
+                bbox = _bbox_from_kpts2d(pred_2d_active[i], img_hw)
+                crops_rgb.append(_extract_crop(image_rgb_hwc, bbox))
+
+            # Build per-person labels — confidence=1.0 for all active tracks
             active_confidences = np.ones(n_active, dtype=np.float32)
             persons = convert_frame_labels(
-                pred_3d_active, K_np, img_hw, ids_active, active_confidences
+                pred_3d_active, K_np, img_hw, ids_active, active_confidences,
+                pred_2d_all=pred_2d_active,
+                crops_rgb=crops_rgb,
             )
 
             # Filter out detections with too few visible joints

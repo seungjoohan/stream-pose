@@ -9,6 +9,8 @@ Each sample in the buffer is one person-frame pair:
     visibility: (27,)   float32  per-joint visibility weight (0 or 1)
     track_id:   int
     frame_idx:  int
+    crop_rgb:   (H, W, 3) uint8  (optional) person crop; returned as (3, 224, 224) float32
+                                  tensor with ImageNet normalization
 
 Usage (producer side):
     dataset = StreamingPoseDataset(capacity=4096)
@@ -31,6 +33,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -182,12 +185,17 @@ class StreamingPoseDataset(Dataset):
         """
         frame_idx = frame_label.get("frame_idx", -1)
         for person in frame_label.get("persons", []):
-            self.push({
+            sample = {
                 "kpts3d": person["kpts3d"],
                 "visibility": person["visibility"].astype(np.float32),
                 "track_id": person.get("track_id", -1),
                 "frame_idx": frame_idx,
-            })
+            }
+            if "crop_rgb" in person:
+                sample["crop_rgb"] = person["crop_rgb"]
+            if "pred_2d" in person:
+                sample["pred_2d"] = person["pred_2d"]
+            self.push(sample)
 
     # ── Consumer API (torch.utils.data.Dataset) ───────────────────────────────
 
@@ -207,11 +215,17 @@ class StreamingPoseDataset(Dataset):
         kpts3d = sample["kpts3d"].copy()           # (27, 3) float32
         visibility = sample["visibility"].copy()   # (27,)  float32 (0 or 1)
 
+        has_crop = "crop_rgb" in sample
+        if has_crop:
+            crop = sample["crop_rgb"].copy()       # (128, 128, 3) uint8
+
         if self._augment:
             # Horizontal flip (50% probability)
             if np.random.rand() < 0.5:
                 kpts3d, visibility = augment_flip(kpts3d, visibility.astype(bool))
                 visibility = visibility.astype(np.float32)
+                if has_crop:
+                    crop = np.fliplr(crop).copy()
 
             # Random scale (85%–115%)
             kpts3d = augment_scale(kpts3d)
@@ -219,12 +233,27 @@ class StreamingPoseDataset(Dataset):
             # Gaussian jitter on visible joints
             kpts3d, _ = augment_jitter(kpts3d, visibility.astype(bool))
 
-        return {
+        output = {
             "kpts3d": torch.from_numpy(kpts3d),
             "visibility": torch.from_numpy(visibility),
             "track_id": sample.get("track_id", -1),
             "frame_idx": sample.get("frame_idx", -1),
         }
+
+        if has_crop:
+            # Use .copy() rather than np.ascontiguousarray: for width-1 arrays,
+            # np.fliplr produces strides like (H*3, -3, 1) which numpy considers
+            # C-contiguous (c_contiguous=True), so ascontiguousarray returns the
+            # same object without copying, leaving the negative stride intact.
+            # .copy() unconditionally normalizes strides and always works.
+            crop_t = torch.from_numpy(crop.copy()).permute(2, 0, 1).float() / 255.0
+            crop_t = TF.resize(crop_t, [224, 224], antialias=True)
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            crop_t = (crop_t - mean) / std
+            output["crop_rgb"] = crop_t
+
+        return output
 
     @property
     def buffer_size(self) -> int:
@@ -254,6 +283,9 @@ class PoseProducer(threading.Thread):
                      If None, one is created lazily on first use.
         loop:        If True, cycle through video_paths indefinitely.
         frameskip:   Process every Nth frame (reduce labeling load).
+        min_half_body_joints: If > 0, skip videos where no person has this many
+                             visible joints (filters legs-only, arms-only, etc.).
+                             Set to 0 to disable. Default 14 (~half of 27 joints).
     """
 
     def __init__(
@@ -263,6 +295,7 @@ class PoseProducer(threading.Thread):
         labeler=None,
         loop: bool = True,
         frameskip: int = 2,
+        min_half_body_joints: int = 14,
     ):
         super().__init__(daemon=True, name="PoseProducer")
         self._video_paths = [Path(p) for p in video_paths]
@@ -270,6 +303,7 @@ class PoseProducer(threading.Thread):
         self._labeler = labeler
         self._loop = loop
         self._frameskip = frameskip
+        self._min_half_body_joints = min_half_body_joints
         self._stop_event = threading.Event()
 
     def stop(self) -> None:
@@ -297,6 +331,21 @@ class PoseProducer(threading.Thread):
                 key = str(vp)
                 if key in skip_set:
                     continue
+                if self._min_half_body_joints > 0:
+                    try:
+                        if not self._labeler.video_has_half_body(
+                            vp, min_visible_joints=self._min_half_body_joints
+                        ):
+                            print(
+                                f"[PoseProducer] Skipping {Path(vp).name}: "
+                                f"no person with ≥{self._min_half_body_joints} visible joints."
+                            )
+                            skip_set.add(key)
+                            continue
+                    except Exception as e:
+                        print(f"[PoseProducer] Half-body check failed for {Path(vp).name}: {e}")
+                        skip_set.add(key)
+                        continue
                 try:
                     for frame_label in self._labeler.label_video(
                         vp, frameskip=self._frameskip

@@ -74,6 +74,7 @@ def run_pipeline(
     video_dir: Path,
     loop: bool,
     frameskip: int,
+    min_half_body_joints: int = 14,
 ):
     """
     Run the full persistent pipeline:
@@ -108,7 +109,12 @@ def run_pipeline(
     dataset = StreamingPoseDataset(capacity=16384, augment=True)
     labeler = CoMotionLabeler()
     producer = PoseProducer(
-        video_paths, dataset, labeler=labeler, loop=loop, frameskip=frameskip
+        video_paths,
+        dataset,
+        labeler=labeler,
+        loop=loop,
+        frameskip=frameskip,
+        min_half_body_joints=min_half_body_joints,
     )
     producer.start()
     print("\n[pipeline] Producer started. Press Ctrl-C to stop.\n")
@@ -150,6 +156,8 @@ def main():
                         help="Process every Nth frame (default: 2)")
     parser.add_argument("--max-frames", type=int, default=50,
                         help="Max frames per video in dry-run mode")
+    parser.add_argument("--min-half-body-joints", type=int, default=14,
+                        help="Skip videos with no person having this many visible joints (0=disable)")
     args = parser.parse_args()
 
     if args.dry_run or args.video:
@@ -165,6 +173,7 @@ def main():
             video_dir=args.video_dir,
             loop=args.loop,
             frameskip=args.frameskip,
+            min_half_body_joints=args.min_half_body_joints,
         )
 
 

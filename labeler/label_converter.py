@@ -89,6 +89,8 @@ def convert_label(
     K: np.ndarray,
     img_hw: tuple[int, int],
     det_confidence: float = None,
+    pred_2d: np.ndarray | None = None,
+    crop_rgb: np.ndarray | None = None,
 ) -> dict:
     """
     Convert one person's camera-space output to a training-ready label.
@@ -108,11 +110,16 @@ def convert_label(
     visibility = compute_visibility(kpts2d, img_hw)   # (27,) bool
     kpts3d_rel = to_pelvis_relative(pred_3d_cam)      # (27, 3)
 
-    return {
+    label = {
         "kpts3d": kpts3d_rel.astype(np.float32),
         "visibility": visibility,
         "confidence": float(det_confidence) if det_confidence is not None else 0.0,
     }
+    if pred_2d is not None:
+        label["pred_2d"] = pred_2d.astype(np.float32)
+    if crop_rgb is not None:
+        label["crop_rgb"] = crop_rgb
+    return label
 
 
 def convert_frame_labels(
@@ -121,16 +128,20 @@ def convert_frame_labels(
     img_hw: tuple[int, int],
     track_ids: np.ndarray,
     confidences: np.ndarray = None,
+    pred_2d_all: np.ndarray | None = None,
+    crops_rgb: list[np.ndarray] | None = None,
 ) -> list[dict]:
     """
     Convert all detections in a frame to per-person training labels.
 
     Args:
-        pred_3d_cam: (n, 27, 3)  camera-space keypoints for n persons
-        K:           (2, 3)      camera intrinsics
-        img_hw:      (H, W)      original image dimensions
-        track_ids:   (n,)        CoMotion track IDs
-        confidences: (n,) | None per-detection sigmoid confidence
+        pred_3d_cam:  (n, 27, 3)  camera-space keypoints for n persons
+        K:            (2, 3)      camera intrinsics
+        img_hw:       (H, W)      original image dimensions
+        track_ids:    (n,)        CoMotion track IDs
+        confidences:  (n,) | None per-detection sigmoid confidence
+        pred_2d_all:  (n, 27, 2) | None  pixel-space 2D keypoints
+        crops_rgb:    list of (128,128,3) uint8 | None  per-person image crops
 
     Returns:
         List of n dicts, each containing:
@@ -138,13 +149,17 @@ def convert_frame_labels(
             kpts3d:     (27, 3) float32  pelvis-relative
             visibility: (27,)   bool
             confidence: float
+            pred_2d:    (27, 2) float32  (if provided)
+            crop_rgb:   (128, 128, 3) uint8  (if provided)
     """
     n = len(pred_3d_cam)
     confs = confidences if confidences is not None else [None] * n
 
     labels = []
     for i in range(n):
-        label = convert_label(pred_3d_cam[i], K, img_hw, confs[i])
+        p2d = pred_2d_all[i] if pred_2d_all is not None else None
+        crop = crops_rgb[i] if crops_rgb is not None else None
+        label = convert_label(pred_3d_cam[i], K, img_hw, confs[i], pred_2d=p2d, crop_rgb=crop)
         label["track_id"] = int(track_ids[i])
         labels.append(label)
 
